@@ -34,6 +34,7 @@ def load_model(checkpoint_path, device):
         'input_seq_len': 28,
         'output_seq_len': 7
     })
+    is_dmh = bool(checkpoint.get('dmh', False))
     
     # Check if model was trained with embeddings by looking for embedding weights
     has_embeddings = 'restaurant_embedding.embedding.weight' in checkpoint['model_state_dict']
@@ -49,8 +50,17 @@ def load_model(checkpoint_path, device):
     else:
         num_features = total_features_in_model
     
-    # Create model - it will add embeddings if needed
-    model = create_model(num_features, config=config, use_pretrained_embeddings=has_embeddings)
+    # Create model - choose DMH if trained that way
+    try:
+        model = create_model(
+            num_features=num_features,
+            config=config,
+            restaurant_embedding=None,
+            menu_embedding=None,
+            direct_multi_horizon=is_dmh,
+        )
+    except TypeError:
+        model = create_model(num_features, config=config)
     
     # Try to load state dict
     try:
@@ -74,7 +84,7 @@ def load_model(checkpoint_path, device):
     model = model.to(device)
     model.eval()
     
-    return model, config
+    return model, config, is_dmh
 
 def prepare_input_sequence(test_df, feature_cols, restaurant_to_idx=None, menu_to_idx=None):
     """Prepare last 28 days of data for each restaurant_menu"""
@@ -147,6 +157,16 @@ def prepare_input_sequence(test_df, feature_cols, restaurant_to_idx=None, menu_t
         
     return sequences, future_features_dict, indices_dict
 
+def build_future_calendar(last_date: pd.Timestamp, horizons: int = 7):
+    """Build [H,8] weekday OHE + KR holiday flags for horizons after last_date."""
+    dates = [last_date + pd.Timedelta(days=h) for h in range(1, horizons + 1)]
+    weekdays = [d.dayofweek for d in dates]
+    weekday_ohe = np.eye(7, dtype=np.float32)[weekdays]
+    hol = np.zeros((horizons, 1), dtype=np.float32)
+    for j, d in enumerate(dates):
+        hol[j, 0] = 1.0 if (d.date() in kr_holidays or d.weekday() >= 5) else 0.0
+    return torch.FloatTensor(np.concatenate([weekday_ohe, hol], axis=1)).unsqueeze(0)
+
 def denormalize_predictions(predictions, menu_scalers, restaurant_menu_list):
     """Denormalize predictions back to original scale"""
     denormalized = {}
@@ -215,7 +235,7 @@ def main(args):
     
     # Load model
     print(f"Loading model from {args.model_path}...")
-    model, config = load_model(args.model_path, device)
+    model, config, is_dmh = load_model(args.model_path, device)
     
     # Get all unique menus from sample submission
     sample_submission = pd.read_csv('data/sample_submission.csv')
@@ -259,10 +279,19 @@ def main(args):
                 rest_idx_tensor = torch.LongTensor([rest_idx]).to(device)
                 menu_idx_tensor = torch.LongTensor([menu_idx]).to(device)
                 
-                # Model prediction with future features and embeddings
-                output = model(input_seq, target=None, teacher_forcing_ratio=0, 
-                             future_features=future_features,
-                             restaurant_idx=rest_idx_tensor, menu_idx=menu_idx_tensor)
+                if is_dmh:
+                    # Build future calendar from last observed date
+                    last_date = test_df[test_df['restaurant_menu'] == restaurant_menu]['date'].max()
+                    future_calendar = build_future_calendar(last_date, horizons=int(config.get('output_seq_len', 7))).to(device)
+                    output = model(input_seq,
+                                   restaurant_idx=rest_idx_tensor,
+                                   menu_idx=menu_idx_tensor,
+                                   future_calendar=future_calendar)
+                else:
+                    # AR path requires future_features
+                    output = model(input_seq, target=None, teacher_forcing_ratio=0, 
+                                   future_features=future_features,
+                                   restaurant_idx=rest_idx_tensor, menu_idx=menu_idx_tensor)
                 output = output.squeeze().cpu().numpy()
                 
                 predictions[restaurant_menu] = output

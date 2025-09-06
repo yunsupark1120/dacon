@@ -124,6 +124,96 @@ def preprocess_data():
     all_df['avg_temp_norm'] = all_df['avg_temp_norm'].fillna(all_df['avg_temp_norm'].mean())
     all_df['rainfall_norm'] = all_df['rainfall_norm'].fillna(0)
     
+    # Ingest additional metadata: group / room / ski totals (daily) and price
+    # 1) GROUP: sum across restaurant columns
+    exo_cols = []
+    try:
+        grp = pd.read_csv('data/train/meta/TRAIN_group.csv')
+        grp['date'] = pd.to_datetime(grp['영업일자'])
+        group_cols = [c for c in grp.columns if c not in ['영업일자', 'date']]
+        for c in group_cols:
+            grp[c] = pd.to_numeric(grp[c], errors='coerce').fillna(0)
+        grp['group_total'] = grp[group_cols].sum(axis=1)
+        exo = grp[['date', 'group_total']].copy()
+    except Exception:
+        exo = pd.DataFrame(columns=['date'])
+
+    # 2) ROOM: sum across columns
+    try:
+        room = pd.read_csv('data/train/meta/TRAIN_room.csv')
+        room['date'] = pd.to_datetime(room['영업일자'])
+        room_cols = [c for c in room.columns if c not in ['영업일자', 'date']]
+        for c in room_cols:
+            room[c] = pd.to_numeric(room[c], errors='coerce').fillna(0)
+        room['room_total'] = room[room_cols].sum(axis=1)
+        if exo.empty:
+            exo = room[['date', 'room_total']].copy()
+        else:
+            exo = exo.merge(room[['date', 'room_total']], on='date', how='outer')
+    except Exception:
+        pass
+
+    # 3) SKI: use daily total column if present; otherwise sum hours
+    try:
+        ski = pd.read_csv('data/train/meta/TRAIN_ski.csv')
+        ski['date'] = pd.to_datetime(ski['영업일자'])
+        if '1일내장객' in ski.columns:
+            ski['ski_total'] = pd.to_numeric(ski['1일내장객'], errors='coerce').fillna(0)
+        else:
+            hour_cols = [c for c in ski.columns if c not in ['영업일자', 'date']]
+            for c in hour_cols:
+                ski[c] = pd.to_numeric(ski[c], errors='coerce').fillna(0)
+            ski['ski_total'] = ski[hour_cols].sum(axis=1)
+        if exo.empty:
+            exo = ski[['date', 'ski_total']].copy()
+        else:
+            exo = exo.merge(ski[['date', 'ski_total']], on='date', how='outer')
+    except Exception:
+        pass
+
+    # Generate lags (1/7/14/28) for exo totals
+    lag_list = [1, 7, 14, 28]
+    if not exo.empty:
+        exo = exo.sort_values('date').reset_index(drop=True)
+        for base in ['group_total', 'room_total', 'ski_total']:
+            if base in exo.columns:
+                for L in lag_list:
+                    exo[f'{base}_lag{L}'] = exo[base].shift(L)
+        # Fill NaNs with 0 then normalize each column 0-1 globally
+        for c in exo.columns:
+            if c == 'date':
+                continue
+            exo[c] = pd.to_numeric(exo[c], errors='coerce').fillna(0)
+            col_min = exo[c].min()
+            col_max = exo[c].max()
+            scale = (col_max - col_min) if (col_max - col_min) != 0 else 1.0
+            exo[c] = (exo[c] - col_min) / scale
+
+        # Merge into all_df
+        all_df = all_df.merge(exo, on='date', how='left')
+        for c in exo.columns:
+            if c == 'date':
+                continue
+            all_df[c] = all_df[c].fillna(0)
+
+    # 4) PRICE: static per menu
+    try:
+        price_df = pd.read_csv('data/train/price.csv')
+        price_df.rename(columns={'영업장명_메뉴명': 'restaurant_menu', '평균판매금액': 'price'}, inplace=True)
+        price_df['price'] = pd.to_numeric(price_df['price'], errors='coerce')
+        all_df = all_df.merge(price_df[['restaurant_menu', 'price']], on='restaurant_menu', how='left')
+        # Fill missing with median
+        median_price = all_df['price'].median() if not np.isnan(all_df['price'].median()) else 0.0
+        all_df['price'] = all_df['price'].fillna(median_price)
+        # log price and normalization
+        all_df['price_log'] = np.log1p(all_df['price'])
+        for col in ['price', 'price_log']:
+            cmin, cmax = all_df[col].min(), all_df[col].max()
+            scale = (cmax - cmin) if (cmax - cmin) != 0 else 1.0
+            all_df[f'{col}_norm'] = (all_df[col] - cmin) / scale
+    except Exception as e:
+        print(f"[WARN] Could not load price.csv: {e}")
+
     # Menu-wise min-max scaling for sales_count
     menu_scalers = {}
     all_df['sales_count_norm'] = 0.0
@@ -143,12 +233,26 @@ def preprocess_data():
     train_mask = all_df['date'] < '2024-01-01'
     train_processed = all_df[train_mask].copy()
     
+    # Choose features (keep minimal, add exo totals + lags + price_norm)
+    exo_feature_cols = []
+    if not exo.empty:
+        for base in ['group_total', 'room_total', 'ski_total']:
+            if base in all_df.columns:
+                exo_feature_cols.append(base)
+                for L in lag_list:
+                    col = f'{base}_lag{L}'
+                    if col in all_df.columns:
+                        exo_feature_cols.append(col)
+
+    price_cols = [c for c in ['price_norm', 'price_log_norm'] if c in all_df.columns]
+
     features = ['sales_count_norm'] + \
                [f'weekday_{i}' for i in range(7)] + \
                ['holiday'] + \
                [f'restaurant_emb_{i}' for i in range(4)] + \
                [f'menu_emb_{i}' for i in range(4)] + \
-               ['avg_temp_norm', 'rainfall_norm']
+               ['avg_temp_norm', 'rainfall_norm'] + \
+               exo_feature_cols + price_cols
     
     # Also include restaurant_idx and menu_idx for embedding lookup
     train_processed = train_processed[['date', 'restaurant_menu', 'restaurant_idx', 'menu_idx'] + features]

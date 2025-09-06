@@ -4,6 +4,12 @@ import torch.nn.functional as F
 import numpy as np
 import os
 import pickle
+from datetime import timedelta
+try:
+    import holidays as _holidays
+    _KR_HOLIDAYS = _holidays.KR()
+except Exception:
+    _KR_HOLIDAYS = None
 
 class PretrainedEmbedding(nn.Module):
     def __init__(self, pretrained_weights=None, num_items=None, embedding_dim=64, trainable=False):
@@ -270,9 +276,9 @@ class SalesDataset(torch.utils.data.Dataset):
     
     def _create_sequences(self):
         samples = []
-        
+
         grouped = self.data.groupby('restaurant_menu')
-        
+
         for name, group in grouped:
             group = group.sort_values('date').reset_index(drop=True)
             
@@ -284,12 +290,26 @@ class SalesDataset(torch.utils.data.Dataset):
             menu_idx = group['menu_idx'].iloc[0] if 'menu_idx' in group.columns else -1
             
             for i in range(0, len(group) - self.input_seq_len - self.output_seq_len + 1, self.stride):
-                input_seq = group.iloc[i:i + self.input_seq_len][self.feature_cols].values
-                output_seq = group.iloc[i + self.input_seq_len:i + self.input_seq_len + self.output_seq_len]['sales_count_norm'].values
-                # Add future features for the output period
-                future_features = group.iloc[i + self.input_seq_len:i + self.input_seq_len + self.output_seq_len][self.feature_cols].values
-                
-                samples.append((input_seq, output_seq, future_features, restaurant_idx, menu_idx))
+                input_df = group.iloc[i:i + self.input_seq_len]
+                horizon_df = group.iloc[i + self.input_seq_len:i + self.input_seq_len + self.output_seq_len]
+
+                input_seq = input_df[self.feature_cols].values
+                output_seq = horizon_df['sales_count_norm'].values
+                # Backward-compat: AR future features (not used in DMH)
+                future_features = horizon_df[self.feature_cols].values
+
+                # Build future calendar features [H, 8]: weekday OHE (7) + holiday (1)
+                horizon_dates = horizon_df['date'].dt.date.values
+                weekdays = [d.weekday() for d in horizon_dates]
+                weekday_ohe = np.eye(7, dtype=np.float32)[weekdays]  # [H,7]
+                hol = np.zeros((self.output_seq_len, 1), dtype=np.float32)
+                if _KR_HOLIDAYS is not None:
+                    for j, d in enumerate(horizon_dates):
+                        # weekend considered holiday in preprocessing; we mimic same rule here
+                        hol[j, 0] = 1.0 if (d in _KR_HOLIDAYS or d.weekday() >= 5) else 0.0
+                future_calendar = np.concatenate([weekday_ohe, hol], axis=1)  # [H,8]
+
+                samples.append((input_seq, output_seq, future_features, restaurant_idx, menu_idx, future_calendar))
         
         return samples
     
@@ -297,36 +317,37 @@ class SalesDataset(torch.utils.data.Dataset):
         return len(self.samples)
     
     def __getitem__(self, idx):
-        input_seq, output_seq, future_features, restaurant_idx, menu_idx = self.samples[idx]
-        return (torch.FloatTensor(input_seq), torch.FloatTensor(output_seq), 
-                torch.FloatTensor(future_features), torch.LongTensor([restaurant_idx]), 
-                torch.LongTensor([menu_idx]))
+        input_seq, output_seq, future_features, restaurant_idx, menu_idx, future_calendar = self.samples[idx]
+        return (
+            torch.FloatTensor(input_seq),
+            torch.FloatTensor(output_seq),
+            torch.FloatTensor(future_features),
+            torch.LongTensor([restaurant_idx]),
+            torch.LongTensor([menu_idx]),
+            torch.FloatTensor(future_calendar),
+        )
 
-def create_model(num_features, config=None, use_pretrained_embeddings=True):
-    """
-    Create and return the sales prediction model
-    
-    Args:
-        num_features: number of input features
-        config: optional configuration dictionary
-        use_pretrained_embeddings: whether to load and use pretrained embeddings
-    """
+def create_model(
+    num_features: int,
+    config: dict | None = None,
+    use_pretrained_embeddings: bool = False,
+    restaurant_embedding: nn.Embedding | None = None,
+    menu_embedding: nn.Embedding | None = None,
+    direct_multi_horizon: bool = False,
+):
+    """Factory for AR or DMH model with optional pretrained embeddings."""
     default_config = {
         'hidden_dim': 256,
         'num_layers': 3,
         'dropout': 0.2,
         'input_seq_len': 28,
-        'output_seq_len': 7
+        'output_seq_len': 7,
     }
-    
     if config:
         default_config.update(config)
-    
-    # Load pretrained embeddings if available
-    restaurant_embedding = None
-    menu_embedding = None
-    
-    if use_pretrained_embeddings:
+
+    # Optionally load embedding weights if requested and not provided
+    if use_pretrained_embeddings and (restaurant_embedding is None or menu_embedding is None):
         rest_emb_weights, menu_emb_weights, _, _ = load_pretrained_embeddings()
         if rest_emb_weights is not None and menu_emb_weights is not None:
             restaurant_embedding = PretrainedEmbedding(rest_emb_weights, trainable=False)
@@ -334,20 +355,33 @@ def create_model(num_features, config=None, use_pretrained_embeddings=True):
             print(f"Loaded pretrained embeddings: Restaurant {rest_emb_weights.shape}, Menu {menu_emb_weights.shape}")
         else:
             print("Pretrained embeddings not found, using random initialization")
-    
-    model = SalesPredictor(
+
+    use_emb = (restaurant_embedding is not None) and (menu_embedding is not None)
+
+    if direct_multi_horizon:
+        return SalesPredictorDMH(
+            num_features=num_features,
+            hidden_dim=int(default_config['hidden_dim']),
+            num_layers=int(default_config['num_layers']),
+            dropout=float(default_config['dropout']),
+            input_seq_len=int(default_config['input_seq_len']),
+            num_horizons=int(default_config['output_seq_len']),
+            restaurant_embedding=restaurant_embedding,
+            menu_embedding=menu_embedding,
+            use_embeddings=use_emb,
+        )
+
+    return SalesPredictor(
         num_features=num_features,
-        hidden_dim=default_config['hidden_dim'],
-        num_layers=default_config['num_layers'],
-        dropout=default_config['dropout'],
-        input_seq_len=default_config['input_seq_len'],
-        output_seq_len=default_config['output_seq_len'],
+        hidden_dim=int(default_config['hidden_dim']),
+        num_layers=int(default_config['num_layers']),
+        dropout=float(default_config['dropout']),
+        input_seq_len=int(default_config['input_seq_len']),
+        output_seq_len=int(default_config['output_seq_len']),
         restaurant_embedding=restaurant_embedding,
         menu_embedding=menu_embedding,
-        use_embeddings=(restaurant_embedding is not None)
+        use_embeddings=use_emb,
     )
-    
-    return model
 
 class SalesPredictorDMH(nn.Module):
     """
@@ -404,15 +438,22 @@ class SalesPredictorDMH(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # Horizon conditioning (learned embedding 0..6)
+        # Horizon conditioning (learned embedding 0..H-1)
         self.horizon_emb = nn.Embedding(self.H, horizon_emb_dim)
-        self.horizon_fuse = nn.Sequential(
-            nn.Linear(hidden_dim + horizon_emb_dim, hidden_dim),
+
+        # Multi-head attention to attend encoder sequence per horizon
+        self.mha = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=4, batch_first=True)
+        self.query_proj = nn.Linear(hidden_dim + horizon_emb_dim, hidden_dim)
+
+        # Calendar projection (weekday OHE [+ optional holiday]) → hidden
+        self.cal_proj = nn.Linear(8, hidden_dim)  # supports [7 weekday + 1 holiday]; extra dims will be safely sliced
+
+        # Fuse [context, z_rep, cal] then predict
+        self.fuse = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
-
-        # Shared output layer (applied per horizon after fuse)
         self.out = nn.Linear(hidden_dim, 1)
 
         # Optional non-negative output
@@ -420,9 +461,11 @@ class SalesPredictorDMH(nn.Module):
 
     def forward(self, x_seq: torch.Tensor,
                 restaurant_idx: torch.Tensor | None = None,
-                menu_idx: torch.Tensor | None = None) -> torch.Tensor:
+                menu_idx: torch.Tensor | None = None,
+                future_calendar: torch.Tensor | None = None) -> torch.Tensor:
         """
         x_seq: [B,T,F_in]
+        future_calendar: [B, H, C] where C>=7 (weekday OHE) and optionally +1 holiday
         return: [B,7]
         """
         B, T, F = x_seq.shape
@@ -437,8 +480,8 @@ class SalesPredictorDMH(nn.Module):
             e = e.unsqueeze(1).expand(B, T, -1)            # repeat across time
             x = torch.cat([x, e], dim=-1)                  # [B,T,F+Er+Em]
 
-        # LSTM encoder: take the top layer's last hidden state
-        _, (h_n, _) = self.encoder(x)          # h_n: [num_layers, B, H]
+        # LSTM encoder: take sequence and last hidden state
+        enc_seq, (h_n, _) = self.encoder(x)    # enc_seq: [B,T,H]
         enc = h_n[-1]                          # [B, hidden]
         z = self.head_prep(enc)                # [B, hidden]
 
@@ -448,9 +491,31 @@ class SalesPredictorDMH(nn.Module):
         h_emb = h_emb.unsqueeze(0).expand(B, -1, -1)       # [B,7,Dh]
         z_rep = z.unsqueeze(1).expand(B, self.H, z.shape[-1])  # [B,7,H]
 
-        zh = torch.cat([z_rep, h_emb], dim=-1)             # [B,7,H+Dh]
-        zh = self.horizon_fuse(zh)                         # [B,7,H]
-        y = self.out(zh).squeeze(-1)                       # [B,7]
+        # Build per-horizon queries from [z, h_emb]
+        q = torch.cat([z_rep, h_emb], dim=-1)              # [B,7,H+Dh]
+        q = self.query_proj(q)                             # [B,7,H]
+
+        # Attend encoder sequence per horizon
+        ctx, _ = self.mha(q, enc_seq, enc_seq)             # [B,7,H]
+
+        # Calendar features: expect at least 7 dims (weekday OHE), optional holiday at [:,:,7]
+        if future_calendar is not None:
+            # If more than 8 dims provided, slice to first 8 for safety
+            cal = future_calendar
+            if cal.size(-1) > 8:
+                cal = cal[..., :8]
+            # If only 7 provided, pad a zero holiday column
+            if cal.size(-1) == 7:
+                pad = torch.zeros((B, self.H, 1), device=cal.device, dtype=cal.dtype)
+                cal = torch.cat([cal, pad], dim=-1)
+            cal_h = self.cal_proj(cal)                     # [B,7,H]
+        else:
+            # No calendar provided → zeros
+            cal_h = torch.zeros_like(ctx)
+
+        fused = torch.cat([ctx, z_rep, cal_h], dim=-1)     # [B,7,3H]
+        fused = self.fuse(fused)                            # [B,7,H]
+        y = self.out(fused).squeeze(-1)                    # [B,7]
 
         if self.nonneg:
             y = self.softplus(y)

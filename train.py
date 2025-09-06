@@ -67,7 +67,7 @@ def calculate_smape(pred, target, exclude_zeros=True):
     
     return smape
 
-def train_epoch(model, dataloader, optimizer, criterion, scheduler, device, teacher_forcing_ratio):
+def train_epoch(model, dataloader, optimizer, criterion, scheduler, device, teacher_forcing_ratio, is_dmh: bool = False):
     model.train()
     total_loss = 0
     total_smape = 0
@@ -75,7 +75,12 @@ def train_epoch(model, dataloader, optimizer, criterion, scheduler, device, teac
     progress_bar = tqdm(dataloader, desc='Training')
     
     for batch_idx, batch_data in enumerate(progress_bar):
-        inputs, targets, future_features, restaurant_idx, menu_idx = batch_data
+        # Support optional future_calendar from dataset (length 6)
+        if len(batch_data) == 6:
+            inputs, targets, future_features, restaurant_idx, menu_idx, future_calendar = batch_data
+        else:
+            inputs, targets, future_features, restaurant_idx, menu_idx = batch_data
+            future_calendar = None
         restaurant_idx = restaurant_idx.squeeze(1).to(device)
         menu_idx = menu_idx.squeeze(1).to(device)
         
@@ -83,11 +88,19 @@ def train_epoch(model, dataloader, optimizer, criterion, scheduler, device, teac
         targets = targets.to(device)
         if future_features is not None:
             future_features = future_features.to(device)
+        if future_calendar is not None:
+            future_calendar = future_calendar.to(device)
         
         optimizer.zero_grad()
         
-        outputs = model(inputs, targets, teacher_forcing_ratio, future_features=future_features,
-                       restaurant_idx=restaurant_idx, menu_idx=menu_idx)
+        if is_dmh:
+            outputs = model(inputs,
+                            restaurant_idx=restaurant_idx,
+                            menu_idx=menu_idx,
+                            future_calendar=future_calendar)
+        else:
+            outputs = model(inputs, targets, teacher_forcing_ratio, future_features=future_features,
+                           restaurant_idx=restaurant_idx, menu_idx=menu_idx)
         
         loss = criterion(outputs, targets)
         smape = calculate_smape(outputs, targets, exclude_zeros=False)  # Include zeros during training
@@ -112,7 +125,7 @@ def train_epoch(model, dataloader, optimizer, criterion, scheduler, device, teac
     
     return avg_loss, avg_smape
 
-def evaluate(model, dataloader, criterion, device):
+def evaluate(model, dataloader, criterion, device, is_dmh: bool = False):
     model.eval()
     total_loss = 0
     total_smape = 0
@@ -121,7 +134,11 @@ def evaluate(model, dataloader, criterion, device):
         progress_bar = tqdm(dataloader, desc='Evaluating')
         
         for batch_data in progress_bar:
-            inputs, targets, future_features, restaurant_idx, menu_idx = batch_data
+            if len(batch_data) == 6:
+                inputs, targets, future_features, restaurant_idx, menu_idx, future_calendar = batch_data
+            else:
+                inputs, targets, future_features, restaurant_idx, menu_idx = batch_data
+                future_calendar = None
             restaurant_idx = restaurant_idx.squeeze(1).to(device)
             menu_idx = menu_idx.squeeze(1).to(device)
 
@@ -129,9 +146,17 @@ def evaluate(model, dataloader, criterion, device):
             targets = targets.to(device)
             if future_features is not None:
                 future_features = future_features.to(device)
+            if future_calendar is not None:
+                future_calendar = future_calendar.to(device)
             
-            outputs = model(inputs, target=None, teacher_forcing_ratio=0, future_features=future_features,
-                           restaurant_idx=restaurant_idx, menu_idx=menu_idx)
+            if is_dmh:
+                outputs = model(inputs,
+                                restaurant_idx=restaurant_idx,
+                                menu_idx=menu_idx,
+                                future_calendar=future_calendar)
+            else:
+                outputs = model(inputs, target=None, teacher_forcing_ratio=0, future_features=future_features,
+                               restaurant_idx=restaurant_idx, menu_idx=menu_idx)
             
             loss = criterion(outputs, targets)
             smape = calculate_smape(outputs, targets, exclude_zeros=True)  # Exclude zeros during evaluation
@@ -144,8 +169,9 @@ def evaluate(model, dataloader, criterion, device):
                 'SMAPE': f'{smape:.2f}%'
             })
     
-    avg_loss = total_loss / len(dataloader)
-    avg_smape = total_smape / len(dataloader)
+    n = max(1, len(dataloader))
+    avg_loss = total_loss / n
+    avg_smape = total_smape / n
     
     return avg_loss, avg_smape
 
@@ -168,11 +194,18 @@ def main(args):
         )
         val_dataset = None
     else:
-        print("Eval mode: Splitting data into train/val")
-        # Split by date - use data before 2023-11-01 for training
-        train_mask = train_data['date'] < '2023-11-01'
-        train_split = train_data[train_mask]
-        val_split = train_data[~train_mask]
+        # Robust time-aware split
+        if args.val_from:
+            val_start = pd.Timestamp(args.val_from)
+        else:
+            max_date = train_data['date'].max()
+            needed = args.input_seq_len + args.output_seq_len
+            val_days = max(int(args.val_days), int(needed))
+            val_start = max_date - pd.Timedelta(days=val_days - 1)
+
+        print(f"Eval mode: Splitting (date < {val_start.date()} → train, else val)")
+        train_split = train_data[train_data['date'] < val_start]
+        val_split = train_data[train_data['date'] >= val_start]
         
         train_dataset = SalesDataset(
             train_split,
@@ -224,7 +257,17 @@ def main(args):
         'output_seq_len': args.output_seq_len
     }
     
-    model = create_model(num_features, config=model_config, use_pretrained_embeddings=True)
+    # Prefer DMH when requested (no reliance on future unknown covariates)
+    try:
+        model = create_model(
+            num_features=num_features,
+            config=model_config,
+            restaurant_embedding=None,
+            menu_embedding=None,
+            direct_multi_horizon=args.dmh,
+        )
+    except TypeError:
+        model = create_model(num_features, config=model_config)
     model = model.to(device)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -246,18 +289,19 @@ def main(args):
     best_val_smape = float('inf')
     patience_counter = 0
     teacher_forcing_ratio = args.teacher_forcing_start
+    is_dmh = bool(args.dmh)
     
     for epoch in range(args.epochs):    
         # Train
         train_loss, train_smape = train_epoch(
             model, train_loader, optimizer, criterion, 
-            scheduler, device, teacher_forcing_ratio
+            scheduler, device, teacher_forcing_ratio, is_dmh=is_dmh
         )
         print(f"Train - Loss: {train_loss:.4f}, SMAPE: {train_smape:.2f}%")
         
         # Validation
         if val_loader:
-            val_loss, val_smape = evaluate(model, val_loader, criterion, device)
+            val_loss, val_smape = evaluate(model, val_loader, criterion, device, is_dmh=is_dmh)
             print(f"Val - Loss: {val_loss:.4f}, SMAPE: {val_smape:.2f}%")
             
             # Early stopping
@@ -294,11 +338,12 @@ def main(args):
                 torch.save(checkpoint, f'model_epoch{epoch+1}_seed{args.seed}.pt')
                 print(f"Saved checkpoint at epoch {epoch+1}")
         
-        # Decay teacher forcing ratio
-        teacher_forcing_ratio = max(
-            0,
-            teacher_forcing_ratio - (args.teacher_forcing_start / args.epochs)
-        )
+        # Decay teacher forcing ratio (AR only)
+        if not is_dmh:
+            teacher_forcing_ratio = max(
+                0,
+                teacher_forcing_ratio - (args.teacher_forcing_start / max(1, args.epochs))
+            )
     
     # Save final model
     final_checkpoint = {
@@ -326,6 +371,7 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_dim', type=int, default=128, help='Hidden dimension')
     parser.add_argument('--num_layers', type=int, default=2, help='Number of LSTM layers')
     parser.add_argument('--dropout', type=float, default=0.3, help='Dropout rate')
+    parser.add_argument('--dmh', action='store_true', help='Use Direct Multi-Horizon decoder (no AR)')
     
     # Training parameters
     parser.add_argument('--epochs', type=int, default=3, help='Number of epochs')
@@ -340,6 +386,8 @@ if __name__ == "__main__":
     parser.add_argument('--no_eval', action='store_false', help='No evaluation mode - use all data for training')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--num_workers', type=int, default=0, help='Number of workers for dataloader')
+    parser.add_argument('--val_days', type=int, default=35, help='Tail-window days for validation (>= input+output)')
+    parser.add_argument('--val_from', type=str, default=None, help='Validation start date (YYYY-MM-DD)')
     
     args = parser.parse_args()
     
